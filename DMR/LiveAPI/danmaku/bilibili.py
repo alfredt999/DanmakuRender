@@ -30,11 +30,20 @@ class Bilibili(DMAPI):
         encoded_parms = encode_wbi(
             params = {
                 "id": room_id,
+                'type': 0,
+                'web_location': 444.8,
             },
             wbi_img=getWbiKeys(),
         )
         async with aiohttp.ClientSession(headers=Bilibili.headers) as session:
-            async with session.get('https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo', params=encoded_parms) as resp:
+            # 2025-06-28 B站新风控需要cookies中存在buvid3
+            current_cookie = Bilibili.headers.get('cookie', '')
+            if 'buvid3' not in current_cookie or 'buvid4' not in current_cookie:
+                async with session.get("https://api.bilibili.com/x/frontend/finger/spi",timeout=5) as resp:
+                    buvid_json = await resp.json()
+                    current_cookie += f"buvid3={buvid_json['data']['b_3']};buvid4={buvid_json['data']['b_4']};"
+                    Bilibili.headers['cookie'] = current_cookie
+            async with session.get('https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo',headers=Bilibili.headers, params=encoded_parms) as resp:
                 room_json = await resp.json()
                 token = room_json['data']['token']
             
@@ -122,6 +131,7 @@ class Bilibili(DMAPI):
                                 emoticon_url = emoticon_info['url']
                                 emoticon_desc = j.get('info')[1]
                                 msg["content"] = json.dumps({'url':emoticon_url,'desc':emoticon_desc},ensure_ascii=False)
+                                msg['text'] = f'[{emoticon_desc}]'
                                 msg['msg_type'] = 'emoticon'
                         except:
                             pass
