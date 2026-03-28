@@ -61,7 +61,6 @@ class biliuprs():
         line:str=None,
         limit:int=3,
         no_reprint:int=1,
-        open_elec:int=1,
         source:str='',
         tag:str='',
         tid:int=65,
@@ -85,7 +84,6 @@ class biliuprs():
             '--dynamic', dynamic,
             '--limit', limit,
             '--no-reprint', no_reprint,
-            '--open-elec', open_elec,
             '--source', source,
             '--tag', tag,
             '--tid', tid,
@@ -124,7 +122,7 @@ class biliuprs():
             upload_proc.kill()
             self._upload_procs.pop(upload_proc.pid)
         
-        return logfile
+        return logfile, upload_args
     
     def islogin(self):
         renew_args = self.base_args + ['renew']

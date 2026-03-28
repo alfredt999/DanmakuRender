@@ -6,10 +6,10 @@
 [简易使用](#简易使用)      
 [常见问题](#常见问题)       
 [完全使用说明](#完全使用说明)      
-[特殊功能](#特殊功能)
+[高级功能](#高级功能)
 
 
-更新日期：2025.9.21。     
+更新日期：2026.01.10。     
 
 ## 简介     
 **本程序的主要功能包括：**
@@ -290,11 +290,11 @@ executable_tools_path:
 # DMR引擎参数
 dmr_engine_args: 
   # 选择组件
+  # 可选组件： downloader（下载器）, render（渲染器）, uploader（上传器）, cleaner（清理器），webservice（WebUI服务，默认不启用）
   enabled_plugins: ['downloader', 'render', 'uploader', 'cleaner']
-  # 是否动态更新配置文件
-  dynamic_config: True
-  # 动态更新的配置文件路径
-  dynamic_config_path: ./configs
+  # 配置文件路径
+  # 可设置为文件/文件夹列表
+  config_path: ./configs
 
 # 默认下载参数
 download_args:
@@ -303,6 +303,9 @@ download_args:
     # 直播间链接
     # 请填写标准格式链接，例如：https://live.bilibili.com/123456
     url: 
+    # 是否使用同步上传功能（正在测试，目前只支持streamlink）
+    # 启用此功能必须使用实时上传，并使用biliwebapi上传引擎
+    sync: False
     # 录制程序引擎，可选ffmpeg, streamgears, pyrequests 或者 streamlink
     # 在使用streamgears作为录制引擎时不支持录制B站hls流
     # 建议PC推流的直播使用ffmpeg录制，手机推流的直播使用streamgears录制
@@ -332,6 +335,7 @@ download_args:
       # 直播流CDN
       # 对于虎牙直播，此项可选al, tx, hw等cdn服务器的缩写
       # 对于B站，可选特定的CDN域名前缀，例如：c1--cn-gotcha208
+      # 斗鱼可选 hs-h5 或者默认 (https://github.com/SmallPeaches/DanmakuRender/issues/506)
       # 或者正则匹配特定CDN，例如：.*cn-gotcha.*
       # 默认为空，由程序随机选择可用cdn
       stream_cdn: ~
@@ -343,6 +347,8 @@ download_args:
       # B站观看cookies，用于获取直播流，如果不填写则使用登录B站上传视频的cookies
       # 如果希望不登录录制最低画质，请设置为'None'
       bili_watch_cookies: .login_info/bili_watch_cookies.json
+      # 虎牙使用mobile api获取流(https://github.com/SmallPeaches/DanmakuRender/issues/490#issuecomment-3322342040)
+      huya_mobile_api: False
     # 高级视频录制参数
     # 请确保你明白这些参数的含义后再修改
     advanced_video_args: 
@@ -352,6 +358,9 @@ download_args:
       start_check_interval: 60
       # 下播检测间隔，在主播下播但是未超过延迟下播时间时使用
       stop_check_interval: 60
+      # 重启间隔时间，可设置为 [起始间隔，步长，最大间隔]
+      # 设置为数字将会是定值
+      restart_interval: [0, 10, 60]
       # 视频文件名称最长长度，超过此长度的文件名称将会被裁剪，默认80（B站视频名称最大长度）
       # 最大设置为256，否则文件无法被创建
       max_fn_length: 80
@@ -374,6 +383,8 @@ download_args:
       ffmpeg_output_args: [ '-movflags','faststart+frag_keyframe+empty_moov']
       # 禁用下载速度慢时自动重启(仅ffmpeg下载引擎生效)
       disable_lowspeed_interrupt: false
+      # streamlink画质选项（默认best）
+      streamlink_quality: ~
       # streamlink 额外输入参数
       # 可用参数列表请参考 https://streamlink.github.io/cli.html
       streamlink_extra_args: [
@@ -502,7 +513,7 @@ download_args:
     # 此参数将直接传入下载引擎，可以用来设置一些特殊的下载参数
     extra_args: []
   
-  # 虚拟下载（此功能暂不可用）
+  # 虚拟下载
   # 可以监控文件夹中的视频文件，用于和其他软件协同，详情请参考文档
   virtual:
     # 监控文件夹
@@ -620,28 +631,25 @@ uploader_kernel_args:
 upload_args:
   # 上传到B站
   bilibili:
-    # 上传引擎，目前只支持biliuprs
+    # 上传引擎，可选biliuprs或者biliwebapi
     engine: biliuprs
     # 上传账号名称，程序依靠这个来识别不同的账号，如果打算传不同账号就要设置不同的名称
     account: bilibili
     # 上传cookies路径，如果设置为空将会保存到./login_info/{ACCOUNT}.json
     cookies: ~
-    # 任务级上传锁，此功能保证同一个任务中的上传是串行的从而保证视频顺序，默认True
-    # 如果设置为False，那么除第一个视频外其他所有上传任务将会完全并行
-    # 对非实时上传的任务无效
-    task_upload_lock: True
     # 重试次数，如果上传遇到错误将会重试，设置为0表示不重试
     # 注意：重试会整个视频重传，并且阻塞后面视频的上传，不应该设置太大
+    # 同步上传无法重传
     retry: 3
-    # 上传超时时间（秒），如果上传时间超过这个时间将会被强制终止（用于防止biliup卡死），0表示不限制
+    # 上传超时时间（秒），如果上传时间超过这个时间将会被强制终止（用于防止biliuprs卡死），0表示不限制
+    # biliwebapi不生效
     timeout: 0
     # 实时上传（边录边传），每录制一个分段上传一次，同一场直播的不同分P仍然会在一个视频下，默认开启
-    # 注意：实时上传可能无法上传很短的视频，尤其是在网速较快的情况下（B站对修改稿件的间隔有限制）
     realtime: True
     # 上传的视频最短长度，小于此长度的视频会被自动过滤，默认120s
     min_length: 120
     # 以下参数来自biliuprs，详细内容可以参考 https://biliup.github.io/biliup-rs/index.html
-    # 上传线路，设置为空则由biliuprs自动选择
+    # 上传线路，设置为空则由程序自动选择
     line: ~
     # 上传线程数
     limit: 3
@@ -674,11 +682,28 @@ upload_args:
     dtime: 0
     # 允许转载? 0-允许转载，1-禁止转载
     no_reprint: 1
-    # 是否开启充电? 0-关闭 1-开启
-    open_elec: 1
-    # 额外参数列表
-    # 此参数将直接传入biliup-rs，可以用来设置一些特殊的功能，例如仅自己可见
+    # 额外参数列表（仅biliuprs生效）
+    # 此参数将直接传入biliup-rs
     extra_args: ~
+
+    # 以下参数仅biliwebapi生效
+    # 视频分P排序，默认False（按实际上传的时间排序），设置为True则按文件名称排序
+    sort_videos: False
+    # 杜比音频? 0-关闭 1-开启
+    dolby: 0
+    # hires音频? 0-关闭 1-开启
+    hires: 0
+    # 仅自己可见? 0-否 1-是
+    is_only_self: 0
+    # 充电视频? 0-否 1-是
+    charging_pay: 0
+    # 开放字幕投稿?
+    open_subtitle: False
+    # 简介中的at信息，设置方法请参考biliup
+    credits: ~
+    # 额外请求参数（此功能暂不生效）
+    # 此参数将直接作为上传请求提交的参数
+    extra_kwargs: {}
   
   # 上传到YouTube
   # 此功能使用较复杂，细节请参考文档
@@ -799,14 +824,25 @@ clean_args:
     w_srcfile: False
     w_srcpre: True
 
-# WebAPI
+# WebUI参数
 webservice_kernel_args:
+  # 启用 Web API
   web_api: True
+  # 服务端口
+  port: 5000
+  # 绑定地址
+  host: '0.0.0.0'
+  # 是否强制登录
+  force_login: True
+  # 管理员用户名
+  username: 'admin'
+  # 管理员密码
+  password: 'admin'
 ```
 
 </details>
 
-## 特殊功能
+## 高级功能
 本节介绍一些不常用的高级功能，这些功能可能随版本更新随时更改。    
 
 ### 弹幕模板(download_args.dm_template)
@@ -927,3 +963,8 @@ advanced_video_args:
   min_video_duration: ~
 ```
 如果设置了自动清理，那么使用虚拟录制处理的所有文件都将被正常清理，如果希望保留源文件或者完全分离不同软件之间的处理逻辑，可以设置output_dir让程序复制文件后处理。      
+
+
+### WebUI可视化操作(webservice_kernel_args)
+**注意：此功能正在测试，默认为关**      
+由[haha252](https://github.com/haha252)开发的WebUI界面([#522](https://github.com/SmallPeaches/DanmakuRender/pull/522))，需要启用此功能需要设置`dmr_engine_args.enabled_plugins`包含`webservice`，且`webservice_kernel_args.web_api=True`。在启用此功能后，可以通过浏览器访问`<IP>:<Port>`（默认`localhost:5000`）可视化编辑配置文件。       

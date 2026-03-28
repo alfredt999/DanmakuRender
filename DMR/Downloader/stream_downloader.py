@@ -3,6 +3,7 @@ import os
 import queue
 import threading
 import time
+import re
 
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from os.path import join,exists,splitext
@@ -50,6 +51,7 @@ class StreamDownloadTask():
         self.engine = engine or 'auto'
         self.advanced_video_args = advanced_video_args if advanced_video_args else {}
         self.advanced_dm_args = advanced_dm_args if advanced_dm_args else {}
+        self.stoped = True
 
         # if self.engine not in ['ffmpeg', 'streamlink', 'streamgears', 'pyrequests', 'auto']:
         #     raise NotImplementedError(f'No Downloader Named {self.engine}.')
@@ -169,7 +171,7 @@ class StreamDownloadTask():
             if self.plat == 'bilibili':
                 if re.search(r'live_\d+_[a-zA-Z_]{0,10}\d+_[a-zA-Z]{1,10}', stream_url)\
                     and '.m3u8' in stream_url:
-                    this_engine = 'pyrequests'
+                    this_engine = 'ffmpeg'          # pyrequests强制原画可用率不高，改回ffmpeg
                 elif '.m3u8' in stream_url:
                     this_engine = 'ffmpeg'
                 else:
@@ -252,7 +254,10 @@ class StreamDownloadTask():
         while not self.stoped:
             try:
                 for future in as_completed(futures, timeout=60):
-                    return future.result()
+                    try:
+                        return future.result()
+                    except TimeoutError as e:           # 捕获内部的超时，避免死循环
+                        raise RuntimeError(f'{self.taskname} 录制异常退出: {e}') from e
             except TimeoutError:
                 if self.liveapi.Onair() == False:
                     self.logger.debug('LIVE END.')

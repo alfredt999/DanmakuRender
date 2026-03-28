@@ -50,7 +50,7 @@ class DmRender(BaseRender):
                 w, h = int(w*scale), int(h*scale)
                 scale_args = ['-s', f'{w}x{h}']
         else:
-            scale_args = []
+            scale_args = ['-noautoscale']
 
         if platform.system().lower() == 'windows':
             danmaku = danmaku.replace("\\", "/").replace(":/", "\\:/")
