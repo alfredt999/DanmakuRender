@@ -16,5 +16,6 @@ gmssl
 m3u8
 rsa
 pillow
+qrcode
 flask
 

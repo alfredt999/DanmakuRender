@@ -1,8 +1,21 @@
 import subprocess
 import os
 from .toolsmgr import ToolsList
+from .douyin_login import (
+    DEFAULT_COOKIE_PATH as DOUYIN_DEFAULT_COOKIE_PATH,
+    douyin_islogin,
+    douyin_qr_login,
+    ensure_douyin_cookies,
+)
 
-__all__ = ['bili_islogin', 'bili_login']
+__all__ = [
+    'bili_islogin',
+    'bili_login',
+    'douyin_islogin',
+    'douyin_qr_login',
+    'ensure_douyin_cookies',
+    'DOUYIN_DEFAULT_COOKIE_PATH',
+]
 
 def bili_islogin(cookies_path:str, **kwargs) -> bool:
     renew_args = [ToolsList.get('biliup'), '-u', cookies_path, 'renew']

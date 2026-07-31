@@ -2,6 +2,7 @@ import logging
 import random
 import re
 import os
+import uuid
 from typing import Optional
 import requests
 import urllib
@@ -67,10 +68,15 @@ class douyin_utils():
     @classmethod
     def get_headers(cls, extra_cookies:dict=None) -> dict:
         headers = cls.base_headers.copy()
+        # Synthetic web live cookies help some rooms deliver more message types
+        # without a full login. Logged-in cookies in extra_cookies override these.
         cookies = {
             'ttwid': cls.get_ttwid(),
             '__ac_nonce': cls.generate_nonce(),
             'odin_ttid': cls.generate_odin_ttid(),
+            'x-web-secsdk-uid': str(uuid.uuid4()),
+            '__live_version__': '"1.1.4.7838"',
+            'live_use_vvc': '"false"',
         }
         if extra_cookies:
             cookies.update(extra_cookies)

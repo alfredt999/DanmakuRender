@@ -40,6 +40,7 @@ def check_pypi():
         import gmssl
         import rsa
         import PIL
+        import qrcode
         import flask
         return True
     except ImportError:

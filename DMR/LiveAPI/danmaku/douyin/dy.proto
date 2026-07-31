@@ -166,6 +166,33 @@ message GiftStruct {
 
 }
 
+// 轻礼物消息（未登录或部分直播间仅下发此类，信息比 GiftMessage 少）
+message LightGiftMessage {
+  Common common = 1;
+  int64 groupCount = 2;
+  int64 repeatCount = 3;
+  int64 comboCount = 4;
+  int64 toUserId = 5;
+  GiftIMPriority priority = 6;
+  GiftInfo giftInfo = 7;
+  GiftLiteTrayInfo trayInfo = 8;
+  int64 sendType = 9;
+  int64 count = 10;
+  string diyItemInfo = 11;
+  int64 bannedDisplayEffects = 12;
+  GiftStruct giftStruct = 13;
+}
+
+message GiftInfo {
+  int64 giftId = 1;
+  Image giftIcon = 2;
+  int64 diamondCount = 3;
+}
+
+message GiftLiteTrayInfo {
+  int64 durationMs = 1;
+}
+
 message GiftIMPriority {
     repeated uint64 queueSizesList = 1;
     uint64 selfQueuePriority = 2;

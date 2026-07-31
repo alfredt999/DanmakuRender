@@ -19,9 +19,11 @@ from google.protobuf import json_format
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from DMR.LiveAPI.douyin import douyin_utils
-from DMR.utils import split_url, cookiestr2dict, SimpleDanmaku, GiftDanmaku, EntryDanmaku
-from .dy_pb2 import PushFrame, Response, ChatMessage, GiftMessage, MemberMessage
+from DMR.utils import split_url, SimpleDanmaku, GiftDanmaku, EntryDanmaku
+from DMR.utils.douyin_login import ensure_douyin_cookies
+from .dy_pb2 import PushFrame, Response, ChatMessage, GiftMessage, MemberMessage, LightGiftMessage
 from .utils import DouyinDanmakuUtils
+from .gift_map import get_gift_catalog
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -32,19 +34,35 @@ class Douyin:
     heartbeatInterval = 10
 
     def __init__(self, douyin_dm_cookies:str=None) -> None:
-        if not douyin_dm_cookies:
-            self.headers = douyin_utils.get_headers()
-        else:
-            try:
-                if douyin_dm_cookies.endswith('.json'):
-                    with open(douyin_dm_cookies, 'r', encoding='utf-8') as f:
-                        cookies = json.load(f)
-                else:
-                    cookies = cookiestr2dict(douyin_dm_cookies)
-                self.headers = douyin_utils.get_headers(extra_cookies=cookies)
-            except Exception as e:
-                logger.exception(f'解析抖音cookies错误: {e}, 使用默认cookies.')
-                self.headers = douyin_utils.get_headers()
+        cookies = None
+        try:
+            cookies, cookie_path = ensure_douyin_cookies(douyin_dm_cookies)
+            if cookies:
+                where = cookie_path or '配置字符串'
+                logger.info(f'正在使用已登录的抖音 cookies ({where}) 获取弹幕.')
+            elif cookie_path:
+                logger.info('未使用抖音登录 cookies，将以游客模式获取弹幕.')
+        except Exception as e:
+            logger.exception(f'准备抖音cookies失败: {e}, 使用游客模式.')
+            cookies = None
+        self.headers = douyin_utils.get_headers(extra_cookies=cookies)
+
+    async def _refresh_gift_catalog(self, session, room_id_str: str) -> None:
+        """Best-effort fetch of room gift list into local id->name map."""
+        catalog = get_gift_catalog()
+        try:
+            gift_url = douyin_utils.build_request_url(
+                f'https://live.douyin.com/webcast/gift/list/?room_id={room_id_str}&live_id=1&device_platform=web'
+            )
+            async with session.get(gift_url, headers=self.headers, timeout=5) as resp:
+                if resp.status != 200:
+                    return
+                payload = json.loads(await resp.text())
+                n = catalog.update_from_api_payload(payload)
+                if n:
+                    logger.debug(f'抖音礼物映射已更新 {n} 条 (room_id={room_id_str})')
+        except Exception as e:
+            logger.debug(f'拉取抖音礼物列表失败: {e}')
 
     async def get_ws_info(self, url, **kwargs):
         async with aiohttp.ClientSession() as session:
@@ -55,8 +73,9 @@ class Douyin:
                 room_info = json.loads(await resp.text())['data']['data'][0]
                 USER_UNIQUE_ID = DouyinDanmakuUtils.get_user_unique_id()
                 VERSION_CODE = 180800 # https://lf-cdn-tos.bytescm.com/obj/static/webcast/douyin_live/7697.782665f8.js -> a.ry
-                WEBCAST_SDK_VERSION = "1.0.14-beta.0" # https://lf-cdn-tos.bytescm.com/obj/static/webcast/douyin_live/7697.782665f8.js -> ee.VERSION
+                WEBCAST_SDK_VERSION = "1.0.15.0" # keep in sync with current douyin web webcast SDK
                 # logger.info(f"user_unique_id: {USER_UNIQUE_ID}")
+                await self._refresh_gift_catalog(session, room_info['id_str'])
                 sig_params = {
                     "live_id": "1",
                     "aid": "6383",
@@ -85,7 +104,7 @@ class Douyin:
                     # "app_name": "douyin_web",
                     "version_code": VERSION_CODE,
                     "webcast_sdk_version": WEBCAST_SDK_VERSION,
-                    # "update_version_code": "1.0.14-beta.0",
+                    "update_version_code": WEBCAST_SDK_VERSION,
                     # "cookie_enabled": "true",
                     # "screen_width": "1920",
                     # "screen_height": "1080",
@@ -112,6 +131,50 @@ class Douyin:
                 return url, []
 
     @classmethod
+    def _gift_from_light_message(cls, data: dict, now: float):
+        """Build GiftDanmaku from WebcastLightGiftMessage (sparse vs full GiftMessage)."""
+        catalog = get_gift_catalog()
+        common = data.get('common') or {}
+        user = common.get('user') or {}
+        gift_info = data.get('giftInfo') or {}
+        gift_struct = data.get('giftStruct') or {}
+
+        name = user.get('nickName') or '观众'
+        gift_id = gift_info.get('giftId') or gift_struct.get('id')
+        describe = common.get('describe')
+        diamond_hint = gift_info.get('diamondCount')
+        if diamond_hint is None:
+            diamond_hint = gift_struct.get('diamondCount')
+        resolved = catalog.resolve_light_gift(
+            gift_id=gift_id,
+            gift_struct_name=gift_struct.get('name'),
+            describe=describe,
+            diamond_hint=diamond_hint,
+        )
+        gift_name = resolved['name']
+        diamond_count = str(resolved['diamond_count'])
+        gift_count = (
+            data.get('count')
+            or data.get('repeatCount')
+            or data.get('comboCount')
+            or 1
+        )
+        content = describe or f"{name}送给主播{gift_count}个{gift_name}每个价值抖币{diamond_count}"
+        catalog.save()
+
+        return GiftDanmaku(
+            timestamp=now,
+            uname=name,
+            content=content,
+            gift_name=gift_name,
+            gift_count=gift_count,
+            gift_price=diamond_count,
+            price_unit='抖币',
+            dtype='gift',
+            color='ffffff'
+        )
+
+    @classmethod
     def decode_msg(cls, data):
         wss_package = PushFrame()
         wss_package.ParseFromString(data)
@@ -129,6 +192,7 @@ class Douyin:
             ack = obj.SerializeToString()
         
         msgs = []
+        catalog = get_gift_catalog()
         for msg in payload_package.messagesList:
             now = datetime.now().timestamp()
             if msg.method == 'WebcastChatMessage':
@@ -166,17 +230,27 @@ class Douyin:
                   continue
                 name = data['user']['nickName']
                 diamondCount=str(data['gift']['diamondCount'])
+                gift_id = data.get('giftId') or data.get('gift', {}).get('id')
+                gift_name = data['gift']['name']
+                catalog.learn(gift_id, gift_name, data['gift'].get('diamondCount'))
+                catalog.save()
                 msg_dict = GiftDanmaku(
                     timestamp=now,
                     uname=name,
-                    content=f"{name}送给主播{data['repeatCount']}个{data['gift']['name']}每个价值抖币{diamondCount}",
-                    gift_name=data['gift']['name'],
+                    content=f"{name}送给主播{data['repeatCount']}个{gift_name}每个价值抖币{diamondCount}",
+                    gift_name=gift_name,
                     gift_count=data['repeatCount'],
                     gift_price=diamondCount,
                     price_unit='抖币',
                     dtype='gift',
                     color='ffffff'
                 )
+            elif msg.method == 'WebcastLightGiftMessage':
+                # Fallback when room only pushes light gifts (often without login)
+                lightGiftMessage = LightGiftMessage()
+                lightGiftMessage.ParseFromString(msg.payload)
+                data = json_format.MessageToDict(lightGiftMessage, preserving_proto_field_name=True)
+                msg_dict = cls._gift_from_light_message(data, now)
             else:
                 msg_dict = {"timestamp": now, "name": "", "content": "", "msg_type": "other", "raw_data": msg}
             msgs.append(msg_dict)
