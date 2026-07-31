@@ -489,12 +489,86 @@ def _poll_expired(status: str) -> bool:
     return status in ('4', '5', 'expired', 'expire', 'timeout')
 
 
+def _looks_like_risk_block(err: str) -> bool:
+    text = (err or '').lower()
+    return (
+        '4031' in text
+        or '安全风险' in (err or '')
+        or 'gfkadpd' in text
+        or '<!doctype html>' in text
+        or '已阻止此次访问' in (err or '')
+    )
+
+
+def _parse_cookie_input(raw: str) -> Dict[str, str]:
+    """Accept browser cookie string or JSON object text."""
+    text = (raw or '').strip()
+    if not text:
+        return {}
+    if text.startswith('{'):
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError('JSON cookies 必须是对象')
+        return {str(k): str(v) for k, v in data.items() if v is not None and not str(k).startswith('_')}
+
+    # Normalize "a=1; b=2" / "a=1;b=2"
+    cookies: Dict[str, str] = {}
+    for part in text.split(';'):
+        part = part.strip()
+        if not part or '=' not in part:
+            continue
+        key, value = part.split('=', 1)
+        key = key.strip()
+        if key:
+            cookies[key] = value.strip()
+    return cookies
+
+
+def _prompt_manual_cookies(cookies_path: str, allow_skip: bool = True) -> Optional[Dict[str, str]]:
+    """Interactive fallback when API QR login is blocked by Douyin risk control."""
+    print('')
+    print('=' * 56)
+    print('抖音接口扫码登录被风控拦截（常见于服务器/脚本 IP）。')
+    print('请改用浏览器 Cookie 手动导入：')
+    print('  1. 浏览器打开 https://live.douyin.com 并完成登录')
+    print('  2. F12 → Network → 点任意请求 → Request Headers 里复制 Cookie')
+    print('  3. 粘贴到下方后按 Enter（整段一行即可）')
+    if allow_skip:
+        print('输入 s 跳过，使用游客模式')
+    print('=' * 56)
+    try:
+        import webbrowser
+        webbrowser.open('https://live.douyin.com/')
+        print('已尝试打开浏览器。')
+    except Exception:
+        pass
+
+    try:
+        raw = _read_console_line('Cookie> ').strip()
+    except EOFError:
+        return None
+    if allow_skip and raw.lower() in ('s', 'skip', 'n', 'no', ''):
+        print('已跳过抖音登录，使用游客模式。')
+        return None
+    try:
+        cookies = _parse_cookie_input(raw)
+    except Exception as e:
+        print(f'解析 Cookie 失败: {e}')
+        return None
+    if not has_login_markers(cookies):
+        print('未检测到 sessionid/sid_tt，请确认复制的是已登录后的完整 Cookie。')
+        return None
+    save_cookie_dict(cookies_path, cookies)
+    print(f'已保存抖音 cookies 到 {cookies_path}')
+    return cookies
+
+
 def douyin_qr_login(
     cookies_path: str = DEFAULT_COOKIE_PATH,
     timeout: float = 180,
     allow_skip: bool = True,
 ) -> Optional[Dict[str, str]]:
-    """Interactive QR login. Returns cookie dict, or None if skipped/failed."""
+    """Interactive QR login, with manual cookie paste when API is risk-blocked."""
     global _skip_this_process
     if _skip_this_process:
         return None
@@ -504,21 +578,28 @@ def douyin_qr_login(
         _skip_this_process = True
         return None
 
+    print('')
+    print('=' * 56)
+    print('抖音弹幕登录 cookies 缺失或已失效。')
+    print('扫码登录可获得更完整礼物消息；游客模式功能有限。')
+    print('  [Enter] 尝试接口扫码')
+    print('  [p]     手动粘贴浏览器 Cookie（推荐，风控时可用）')
     if allow_skip:
-        print('')
-        print('=' * 56)
-        print('抖音弹幕登录 cookies 缺失或已失效。')
-        print('扫码登录后可获得更完整的礼物等消息；游客模式功能有限。')
-        print('按 Enter 开始扫码登录，输入 s 然后 Enter 跳过：')
-        print('=' * 56)
-        try:
-            choice = _read_console_line('> ').strip().lower()
-        except EOFError:
-            choice = 's'
-        if choice in ('s', 'skip', 'n', 'no'):
-            print('已跳过抖音登录，使用游客模式。')
+        print('  [s]     跳过，使用游客模式')
+    print('=' * 56)
+    try:
+        choice = _read_console_line('> ').strip().lower()
+    except EOFError:
+        choice = 's'
+    if allow_skip and choice in ('s', 'skip', 'n', 'no'):
+        print('已跳过抖音登录，使用游客模式。')
+        _skip_this_process = True
+        return None
+    if choice in ('p', 'paste', 'm', 'manual'):
+        cookies = _prompt_manual_cookies(cookies_path, allow_skip=allow_skip)
+        if cookies is None and allow_skip:
             _skip_this_process = True
-            return None
+        return cookies
 
     fp = _generate_fp()
     session = requests.Session()
@@ -528,17 +609,22 @@ def douyin_qr_login(
     payload, meta, err = _request_qrcode(session, fp, csrf)
     if not payload:
         print(f'获取抖音登录二维码失败: {err}')
-        print('可改为手动登录：浏览器打开 https://live.douyin.com 登录后，把 Cookie 存成 JSON 到')
-        print(f'  {cookies_path}')
-        print('至少包含 sessionid（推荐再含 ttwid）。或设置 douyin_dm_cookies: None 跳过。')
-        return None
+        if _looks_like_risk_block(err):
+            print('原因：抖音风控拦截了脚本/接口扫码（error 4031），这在服务器或自动化请求上很常见。')
+        cookies = _prompt_manual_cookies(cookies_path, allow_skip=allow_skip)
+        if cookies is None and allow_skip:
+            _skip_this_process = True
+        return cookies
 
     # Prefer server csrf after QR request
     csrf = session.cookies.get('passport_csrf_token') or csrf
     token, qr_url, qr_b64 = _extract_qr_fields(payload)
     if not token:
         print(f'获取抖音登录二维码失败: 无 token {payload}')
-        return None
+        cookies = _prompt_manual_cookies(cookies_path, allow_skip=allow_skip)
+        if cookies is None and allow_skip:
+            _skip_this_process = True
+        return cookies
 
     aid = meta.get('aid', _AID)
     service = meta.get('service', _SERVICE)
@@ -549,7 +635,6 @@ def douyin_qr_login(
     headers = _headers(referer=referer, origin=origin, csrf=csrf)
 
     qr_path = os.path.join(os.path.dirname(os.path.abspath(cookies_path)) or '.login_info', 'douyin_login_qr.png')
-    # Prefer terminal ASCII QR (works over SSH). GUI open is skipped on SSH/headless.
     shown = False
     if qr_url:
         print('请使用抖音 App 扫描下方终端二维码：')
@@ -634,7 +719,7 @@ def douyin_qr_login(
                 print('已扫码，请在手机上确认登录…')
             elif _poll_expired(st):
                 print('二维码已过期，请重新触发登录。')
-                return None
+                return _prompt_manual_cookies(cookies_path, allow_skip=allow_skip)
             elif _poll_confirmed(st):
                 print('已确认，正在保存 cookies…')
             else:
@@ -647,25 +732,27 @@ def douyin_qr_login(
                     session.get(redirect, headers=headers, timeout=20, allow_redirects=True)
                 except Exception as e:
                     logger.debug(f'跟随 redirect_url 失败: {e}')
-            # Touch live domain so live cookies settle
             try:
                 session.get('https://live.douyin.com/', headers=_headers('https://live.douyin.com/'), timeout=15)
             except Exception:
                 pass
             cookies = _session_cookies_dict(session)
             if not has_login_markers(cookies):
-                print('登录完成但未拿到 sessionid，请重试或手动配置 cookies。')
-                return None
+                print('登录完成但未拿到 sessionid，请改用手动导入 Cookie。')
+                return _prompt_manual_cookies(cookies_path, allow_skip=allow_skip)
             save_cookie_dict(cookies_path, cookies)
             print(f'抖音登录成功，cookies 已保存到 {cookies_path}')
             return cookies
 
         if _poll_expired(st):
-            return None
+            return _prompt_manual_cookies(cookies_path, allow_skip=allow_skip)
         time.sleep(2)
 
-    print('扫码登录超时，将使用游客模式。')
-    return None
+    print('扫码登录超时。')
+    cookies = _prompt_manual_cookies(cookies_path, allow_skip=allow_skip)
+    if cookies is None and allow_skip:
+        _skip_this_process = True
+    return cookies
 
 
 def douyin_islogin(cookies_path: str = DEFAULT_COOKIE_PATH, refresh: bool = True) -> bool:
@@ -707,9 +794,8 @@ def ensure_douyin_cookies(
     # Explicit cookie string (not a json path)
     if douyin_dm_cookies and not str(douyin_dm_cookies).strip().endswith('.json') \
             and str(douyin_dm_cookies).strip() not in ('', '~'):
-        from DMR.utils.utils import cookiestr2dict
         try:
-            return cookiestr2dict(str(douyin_dm_cookies)), None
+            return _parse_cookie_input(str(douyin_dm_cookies)), None
         except Exception as e:
             logger.warning(f'解析抖音 cookie 字符串失败: {e}')
             return None, None
