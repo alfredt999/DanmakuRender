@@ -8,7 +8,8 @@ import logging
 
 from .engine import DMREngine
 from .Config import Config
-from .utils import filename_to_taskname
+from .utils import filename_to_taskname, split_url
+from .utils.douyin_login import ensure_douyin_cookies
 
 
 class DanmakuRender():
@@ -20,12 +21,52 @@ class DanmakuRender():
         self.engine_args = self.config.get_config('dmr_engine_args')
         self.engine = DMREngine()
 
+    def _ensure_douyin_login(self) -> None:
+        """Prompt Douyin QR login at startup for Douyin danmaku tasks (not only after live)."""
+        cookie_opts = []
+        for taskname in self.config.get_replaytasks():
+            try:
+                cfg = self.config.get_replay_config(taskname)
+                dl = cfg.get('download_args') or {}
+                if not dl.get('danmaku', True):
+                    continue
+                url = dl.get('url') or ''
+                if not url:
+                    continue
+                plat, _ = split_url(url)
+                if plat != 'douyin':
+                    continue
+                opt = (dl.get('dm_stream_option') or {}).get('douyin_dm_cookies')
+                cookie_opts.append(opt)
+            except Exception as e:
+                self.logger.debug(f'检查抖音登录任务失败 {taskname}: {e}')
+
+        if not cookie_opts:
+            return
+
+        seen = set()
+        for opt in cookie_opts:
+            key = str(opt)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                self.logger.info('检测到抖音弹幕任务，正在检查/登录抖音 cookies…')
+                cookies, path = ensure_douyin_cookies(opt)
+                if cookies:
+                    self.logger.info(f'抖音登录 cookies 就绪: {path or "配置字符串"}')
+                else:
+                    self.logger.info('抖音弹幕将使用游客模式（未登录或已跳过）。')
+            except Exception as e:
+                self.logger.warning(f'抖音登录准备失败，将使用游客模式: {e}')
+
     def start(self):
         self.stoped = False
         os.makedirs('.temp', exist_ok=True)
         
         self.logger.debug(f'Global Config:\n{json.dumps(self.config.global_config, indent=4, ensure_ascii=False)}')
         self.logger.debug(f'Replay Config:\n{json.dumps(self.config.replay_config, indent=4, ensure_ascii=False)}')
+        self._ensure_douyin_login()
         self.engine.start()
         plugin_enabled = self.config.get_config('dmr_engine_args')['enabled_plugins']
         for plugin_name in plugin_enabled:

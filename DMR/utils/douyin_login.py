@@ -57,11 +57,41 @@ def _normalize_path(cookies: Optional[str]) -> Optional[str]:
     return path
 
 
-def _interactive() -> bool:
+def _console_stdin():
+    """Prefer real console when stdin is redirected (Cursor/IDE/pipes)."""
     try:
-        return sys.stdin is not None and sys.stdin.isatty()
+        if sys.stdin is not None and sys.stdin.isatty():
+            return sys.stdin
     except Exception:
-        return False
+        pass
+    try:
+        if sys.platform.startswith('win'):
+            return open('CON:', 'r', encoding='utf-8', errors='replace')
+        return open('/dev/tty', 'r', encoding='utf-8', errors='replace')
+    except Exception:
+        return None
+
+
+def _interactive() -> bool:
+    return _console_stdin() is not None
+
+
+def _read_console_line(prompt: str = '') -> str:
+    if prompt:
+        print(prompt, end='', flush=True)
+    con = _console_stdin()
+    if con is None:
+        raise EOFError('no console')
+    line = con.readline()
+    if line == '':
+        raise EOFError('eof')
+    # Don't close sys.stdin; only close our own CON:/tty handle
+    if con is not sys.stdin:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return line
 
 
 def _generate_fp() -> str:
@@ -318,7 +348,7 @@ def douyin_qr_login(
         print('按 Enter 开始扫码登录，输入 s 然后 Enter 跳过：')
         print('=' * 56)
         try:
-            choice = input('> ').strip().lower()
+            choice = _read_console_line('> ').strip().lower()
         except EOFError:
             choice = 's'
         if choice in ('s', 'skip', 'n', 'no'):
@@ -383,8 +413,9 @@ def douyin_qr_login(
             return
         try:
             while not skip_flag['v']:
-                line = sys.stdin.readline()
-                if not line:
+                try:
+                    line = _read_console_line()
+                except EOFError:
                     break
                 if line.strip().lower() in ('s', 'skip', 'n'):
                     skip_flag['v'] = True
