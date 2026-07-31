@@ -37,6 +37,13 @@ _SERVICE = 'https://www.douyin.com'
 _NEXT = 'https://www.douyin.com'
 _AID = '6383'
 
+# Fallback login targets: (label, aid, service, next, referer, origin)
+_QR_TARGETS = (
+    ('www', '6383', 'https://www.douyin.com', 'https://www.douyin.com', 'https://www.douyin.com/', 'https://www.douyin.com'),
+    ('live', '6383', 'https://live.douyin.com', 'https://live.douyin.com', 'https://live.douyin.com/', 'https://live.douyin.com'),
+    ('creator', '2906', 'https://creator.douyin.com', 'https://creator.douyin.com/content/manage', 'https://creator.douyin.com/', 'https://creator.douyin.com'),
+)
+
 
 def _is_skip_config(value: Any) -> bool:
     if value is None:
@@ -99,12 +106,169 @@ def _generate_fp() -> str:
     return 'verify_' + ''.join(random.choice(chars) for _ in range(32))
 
 
-def _headers(referer: str = _SERVICE + '/') -> dict:
-    return {
-        'User-Agent': random_user_agent(),
-        'Referer': referer,
+def _generate_csrf() -> str:
+    return ''.join(random.choice('0123456789abcdef') for _ in range(32))
+
+
+def _headers(referer: str = _SERVICE + '/', origin: str = None, csrf: str = None) -> dict:
+    ua = random_user_agent()
+    h = {
+        'User-Agent': ua,
         'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': referer,
+        'Origin': origin or referer.rstrip('/'),
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-site',
     }
+    if csrf:
+        h['x-tt-passport-csrf-token'] = csrf
+    return h
+
+
+def _set_cookie(session: requests.Session, name: str, value: str, domain: str = '.douyin.com') -> None:
+    if not value:
+        return
+    try:
+        session.cookies.set(name, value, domain=domain)
+    except Exception:
+        session.cookies.set(name, value)
+
+
+def _bootstrap_login_session(session: requests.Session, fp: str, ua: str) -> str:
+    """Seed ttwid / csrf / verifyFp so SSO get_qrcode returns JSON instead of empty body."""
+    csrf = _generate_csrf()
+    _set_cookie(session, 'passport_csrf_token', csrf)
+    _set_cookie(session, 'passport_csrf_token_default', csrf)
+    _set_cookie(session, 's_v_web_id', fp)
+
+    ttwid = None
+    try:
+        from DMR.LiveAPI.douyin import douyin_utils
+        ttwid = douyin_utils.get_ttwid()
+    except Exception as e:
+        logger.debug(f'通过 douyin_utils 获取 ttwid 失败: {e}')
+
+    for url in (
+        'https://www.douyin.com/',
+        'https://live.douyin.com/',
+        'https://sso.douyin.com/',
+    ):
+        try:
+            session.get(url, headers={'User-Agent': ua, 'Referer': url}, timeout=12, allow_redirects=True)
+        except Exception as e:
+            logger.debug(f'登录预热失败 {url}: {e}')
+        if not ttwid:
+            ttwid = session.cookies.get('ttwid')
+        # Prefer server-issued csrf when present
+        server_csrf = session.cookies.get('passport_csrf_token')
+        if server_csrf:
+            csrf = server_csrf
+            _set_cookie(session, 'passport_csrf_token_default', csrf)
+
+    if ttwid:
+        _set_cookie(session, 'ttwid', ttwid)
+    _set_cookie(session, 'passport_csrf_token', csrf)
+    _set_cookie(session, 'passport_csrf_token_default', csrf)
+    _set_cookie(session, 's_v_web_id', fp)
+    return csrf
+
+
+def _parse_qr_payload(resp: requests.Response) -> Tuple[Optional[dict], str]:
+    text = (resp.text or '').strip()
+    if not text:
+        return None, f'HTTP {resp.status_code}, 空响应'
+    try:
+        payload = resp.json()
+    except Exception:
+        # Some edges return JS-wrapped / non-json; try extract object
+        try:
+            start = text.find('{')
+            end = text.rfind('}')
+            if start >= 0 and end > start:
+                payload = json.loads(text[start:end + 1])
+            else:
+                return None, f'HTTP {resp.status_code}, 非JSON: {text[:160]!r}'
+        except Exception as e:
+            return None, f'HTTP {resp.status_code}, JSON解析失败({e}): {text[:160]!r}'
+    if not isinstance(payload, dict):
+        return None, f'HTTP {resp.status_code}, 响应不是对象'
+    return payload, ''
+
+
+def _extract_qr_fields(payload: dict) -> Tuple[Optional[str], str, Optional[str]]:
+    data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
+    token = data.get('token') or payload.get('token')
+    qr_url = data.get('qrcode_index_url') or data.get('qrcode_url') or ''
+    qr_b64 = data.get('qrcode') or data.get('qrcode_base64')
+    if isinstance(qr_b64, str) and qr_b64.startswith('data:image'):
+        qr_b64 = qr_b64.split(',', 1)[-1]
+    return token, qr_url, qr_b64
+
+
+def _request_qrcode(session: requests.Session, fp: str, csrf: str) -> Tuple[Optional[dict], dict, str]:
+    """Try several Douyin QR endpoints; return (payload, meta, error)."""
+    errors = []
+    for label, aid, service, nxt, referer, origin in _QR_TARGETS:
+        headers = _headers(referer=referer, origin=origin, csrf=csrf)
+        params = {
+            'next': nxt,
+            'aid': aid,
+            'service': service,
+            'is_vcd': '1',
+            'fp': fp,
+            'need_logo': 'false',
+        }
+        # SSO GET
+        try:
+            resp = session.get(
+                'https://sso.douyin.com/get_qrcode/',
+                params=params,
+                headers=headers,
+                timeout=25,
+            )
+            payload, err = _parse_qr_payload(resp)
+            if payload:
+                token, _, _ = _extract_qr_fields(payload)
+                if token:
+                    return payload, {
+                        'aid': aid, 'service': service, 'next': nxt,
+                        'referer': referer, 'origin': origin, 'check': 'sso',
+                    }, ''
+                errors.append(f'{label}/sso: 无token {payload}')
+            else:
+                errors.append(f'{label}/sso: {err}')
+        except Exception as e:
+            errors.append(f'{label}/sso: {type(e).__name__}: {e}')
+
+        # Passport POST (same-origin style used by TikTok/Douyin web)
+        try:
+            resp = session.post(
+                'https://www.douyin.com/passport/web/get_qrcode/',
+                params={'next': nxt, 'aid': aid},
+                headers=_headers(referer=referer, origin=origin, csrf=csrf),
+                timeout=25,
+            )
+            # refresh csrf if Set-Cookie
+            sc = session.cookies.get('passport_csrf_token')
+            if sc:
+                csrf = sc
+            payload, err = _parse_qr_payload(resp)
+            if payload:
+                token, _, _ = _extract_qr_fields(payload)
+                if token:
+                    return payload, {
+                        'aid': aid, 'service': service, 'next': nxt,
+                        'referer': referer, 'origin': origin, 'check': 'passport',
+                    }, ''
+                errors.append(f'{label}/passport: 无token {payload}')
+            else:
+                errors.append(f'{label}/passport: {err}')
+        except Exception as e:
+            errors.append(f'{label}/passport: {type(e).__name__}: {e}')
+
+    return None, {}, ' | '.join(errors[:6])
 
 
 def _session_cookies_dict(session: requests.Session) -> Dict[str, str]:
@@ -358,32 +522,31 @@ def douyin_qr_login(
 
     fp = _generate_fp()
     session = requests.Session()
-    headers = _headers()
-    params = {
-        'next': _NEXT,
-        'aid': _AID,
-        'service': _SERVICE,
-        'is_vcd': '1',
-        'fp': fp,
-    }
-    try:
-        resp = session.get('https://sso.douyin.com/get_qrcode/', params=params, headers=headers, timeout=20)
-        payload = resp.json()
-    except Exception as e:
-        print(f'获取抖音登录二维码失败: {e}')
+    ua = random_user_agent()
+    csrf = _bootstrap_login_session(session, fp, ua)
+
+    payload, meta, err = _request_qrcode(session, fp, csrf)
+    if not payload:
+        print(f'获取抖音登录二维码失败: {err}')
+        print('可改为手动登录：浏览器打开 https://live.douyin.com 登录后，把 Cookie 存成 JSON 到')
+        print(f'  {cookies_path}')
+        print('至少包含 sessionid（推荐再含 ttwid）。或设置 douyin_dm_cookies: None 跳过。')
         return None
 
-    data = payload.get('data') or {}
-    if payload.get('error_code') not in (0, '0', None) and not data.get('token'):
-        print(f'获取抖音登录二维码失败: {payload}')
-        return None
-
-    token = data.get('token')
-    qr_b64 = data.get('qrcode')
-    qr_url = data.get('qrcode_index_url') or ''
+    # Prefer server csrf after QR request
+    csrf = session.cookies.get('passport_csrf_token') or csrf
+    token, qr_url, qr_b64 = _extract_qr_fields(payload)
     if not token:
         print(f'获取抖音登录二维码失败: 无 token {payload}')
         return None
+
+    aid = meta.get('aid', _AID)
+    service = meta.get('service', _SERVICE)
+    nxt = meta.get('next', _NEXT)
+    referer = meta.get('referer', _SERVICE + '/')
+    origin = meta.get('origin', _SERVICE)
+    check_mode = meta.get('check', 'sso')
+    headers = _headers(referer=referer, origin=origin, csrf=csrf)
 
     qr_path = os.path.join(os.path.dirname(os.path.abspath(cookies_path)) or '.login_info', 'douyin_login_qr.png')
     # Prefer terminal ASCII QR (works over SSH). GUI open is skipped on SSH/headless.
@@ -426,16 +589,21 @@ def douyin_qr_login(
     skip_thread = threading.Thread(target=_stdin_skip, daemon=True)
     skip_thread.start()
 
+    jump_service = f'{service}/?logintype=user&loginapp=douyin&jump={nxt}'
     check_params = {
-        'next': _NEXT,
+        'next': nxt,
         'token': token,
-        'service': _SERVICE + '/?logintype=user&loginapp=douyin&jump=' + _NEXT,
-        'correct_service': _SERVICE + '/?logintype=user&loginapp=douyin&jump=' + _NEXT,
-        'aid': _AID,
+        'service': jump_service,
+        'correct_service': jump_service,
+        'aid': aid,
         'is_vcd': '1',
         'fp': fp,
     }
-    check_url = 'https://sso.douyin.com/check_qrconnect/'
+    if check_mode == 'passport':
+        check_url = 'https://www.douyin.com/passport/web/check_qrconnect/'
+        check_params = {'next': nxt, 'token': token, 'aid': aid}
+    else:
+        check_url = 'https://sso.douyin.com/check_qrconnect/'
 
     deadline = time.time() + timeout
     last_status = None
@@ -445,8 +613,13 @@ def douyin_qr_login(
             _skip_this_process = True
             return None
         try:
-            chk = session.get(check_url, params=check_params, headers=headers, timeout=15)
-            body = chk.json()
+            headers = _headers(referer=referer, origin=origin, csrf=session.cookies.get('passport_csrf_token') or csrf)
+            chk = session.get(check_url, params=check_params, headers=headers, timeout=20)
+            body, perr = _parse_qr_payload(chk)
+            if body is None:
+                logger.debug(f'轮询抖音扫码状态失败: {perr}')
+                time.sleep(2)
+                continue
         except Exception as e:
             logger.debug(f'轮询抖音扫码状态失败: {e}')
             time.sleep(2)
